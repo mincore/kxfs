@@ -9,6 +9,7 @@
 #ifndef _UTILS_H
 #define _UTILS_H
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
@@ -54,30 +55,45 @@ static inline std::string make_basename(const std::string &src) {
     return basename(tmp);
 }
 
-template<class T>
-class Future {
-private:
-    class Impl {
-    public:
-        void set(T val) {
+template <class T>
+class Future
+{
+  private:
+    class Impl
+    {
+      public:
+        void set(T val)
+        {
             std::unique_lock<std::mutex> lk(mutex_);
             val_ = val;
             has_val_ = true;
             cond_.notify_all();
         }
 
-        void clear() {
+        void clear()
+        {
             std::unique_lock<std::mutex> lk(mutex_);
             has_val_ = false;
         }
 
-        T& wait() {
+        bool wait(T &val, uint64_t timeout = 0)
+        {
             std::unique_lock<std::mutex> lk(mutex_);
-            cond_.wait(lk, [this]{ return has_val_; });
-            return val_;
+            if (timeout == 0) {
+                cond_.wait(lk, [this] { return has_val_; });
+                val = val_;
+                return true;
+            }
+
+            if (cond_.wait_for(lk, std::chrono::milliseconds(timeout), [this] { return has_val_; })) {
+                val = val_;
+                return true;
+            }
+
+            return false;
         }
 
-    private:
+      private:
         std::mutex mutex_;
         std::condition_variable cond_;
         T val_;
@@ -85,11 +101,11 @@ private:
     };
     std::shared_ptr<Impl> impl_;
 
-public:
-    Future():impl_(std::make_shared<Impl>()) {}
+  public:
+    Future() : impl_(std::make_shared<Impl>()) {}
 
     void set(T val) { impl_->set(val); }
-    T& wait() { return impl_->wait(); }
+    bool wait(T &val, uint64_t timeout = 0) { return impl_->wait(val, timeout); }
 };
 
 static int read_buffer(int fd, void *buffer, int size) {
@@ -116,6 +132,13 @@ static int write_buffer(int fd, const void *buffer, int size) {
         left -= n;
     }
     return size;
+}
+
+static inline int dump_file(const char *file, const void *buffer, int size) {
+    FILE *fp = fopen(file, "w");
+    int ret = fwrite(buffer, 1, size, fp);
+    fclose(fp);
+    return ret;
 }
 
 #endif

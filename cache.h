@@ -15,23 +15,18 @@
 #include <string>
 #include <mutex>
 #include "utils.h"
+#include "msg.h"
 
 #define TIMEOUT 60
 
-struct Attr {
-    int32_t mode;
-    int32_t mtime;
-    int64_t size;
-    std::string link;
-};
-
 struct Entry {
     std::string name;
-    int32_t mode;
+    mode_t mode;
 };
 
 struct _Node {
-    Attr attr;
+    Msg::Attr attr;
+    std::string link;
     std::vector<Entry> entries;
     uint32_t vaild_time;
 };
@@ -46,7 +41,12 @@ public:
     void add_node(const std::string &path, const Node &node) {
         std::unique_lock<std::mutex> lk(node_map_mutex_);
         node_map_[path] = node;
-        node_map_[path]->vaild_time = now_sec() + TIMEOUT;
+        auto& attr = node->attr;
+        if ((attr.mode & S_IFMT) == S_IFDIR && node->entries.empty()) {
+            node_map_[path]->vaild_time = 0;
+        } else{
+            node_map_[path]->vaild_time = now_sec() + TIMEOUT;
+        }
     }
 
     void del_node(const std::string &path) {

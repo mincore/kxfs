@@ -9,122 +9,142 @@
 #ifndef _MSG_H
 #define _MSG_H
 
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <vector>
+#include <string>
 #include <memory>
 #include <atomic>
-#include "kxfs.pb.h"
+#include <string.h>
+#include <assert.h>
+
 #include "log.h"
 #include "utils.h"
+#include "crc16.h"
 
-enum MSG_TYPE {
-    MSG_KEEPALVE,
-    MSG_GETATTR,
-    MSG_MKDIR,
-    MSG_SYMLINK,
-    MSG_UNLINK,
-    MSG_RMDIR,
-    MSG_RENAME,
-    MSG_CHMOD,
-    MSG_TRUNCATE,
-    MSG_UTIMENS,
-    MSG_CREATE,
-    MSG_READ,
-    MSG_WRITE,
-};
+#define CRC_SEED 0
+const char *strmsg(int type);
 
-#ifdef DEBUG
-static inline const char *strmsg(int type) {
-    switch (type) {
-        case MSG_KEEPALVE: return "MSG_KEEPALVE";
-        case MSG_GETATTR: return "MSG_GETATTR";
-        case MSG_MKDIR: return "MSG_MKDIR";
-        case MSG_SYMLINK: return "MSG_SYMLINK";
-        case MSG_UNLINK: return "MSG_UNLINK";
-        case MSG_RMDIR: return "MSG_RMDIR";
-        case MSG_RENAME: return "MSG_RENAME";
-        case MSG_CHMOD: return "MSG_CHMOD";
-        case MSG_TRUNCATE: return "MSG_TRUNCATE";
-        case MSG_UTIMENS: return "MSG_UTIMENS";
-        case MSG_CREATE: return "MSG_CREATE";
-        case MSG_READ: return "MSG_READ";
-        case MSG_WRITE: return "MSG_WRITE";
-    }
-    return "UNKNOWN";
-}
-#endif
-
-struct MsgHead {
-    uint32_t is_boardcast:1;
-    uint32_t has_more:1;
-    uint32_t type:6;
-    uint32_t size:24;
-    uint32_t id;
-    int32_t ret;
-};
-
-struct Msg {
+class Msg {
 public:
-    MsgHead head;
-    std::shared_ptr<uint8_t> data;
+    enum Type {
+        HELLO,
+        KEEPALIVE,
+        GETATTR,
+        MKDIR,
+        SYMLINK,
+        UNLINK,
+        RMDIR,
+        RENAME,
+        CHMOD,
+        TRUNCATE,
+        UTIMENS,
+        READ,
+        WRITE,
+        CREATE,
+        RELEASE,
+    };
 
-    Msg() {
-        memset(&head, 0, sizeof(head));
+    #pragma pack(1)
+    struct Head {
+        uint32_t id;
+        uint32_t type:8;
+        uint32_t size:24;
+        uint32_t crc;
+        int32_t ret;
+    };
+
+    struct Attr {
+        uint32_t mode = 0;
+        uint64_t size = 0;
+        uint64_t mtime = 0;
+        uint64_t ctime = 0;
+    };
+    #pragma pack() 
+
+    Head head = {0};
+    std::vector<uint8_t> data;
+    uint32_t offset = 0;
+
+    void resize(uint32_t size) {
+        data.resize(size);
+        head.size = size;
+        offset = 0;
     }
 
-    template<class T>
-    T get_proto() const {
-        T v;
-        v.ParseFromArray(data.get(), head.size - head.ret);
-        return v;
+    void add_buf(const void *buf, int size) {
+        data.insert(data.end(), (uint8_t*)buf, (uint8_t*)buf+size);
+        head.size += size;
     }
 
-    void set_proto(const ::google::protobuf::Message *src, const void *buffer = NULL, int size = 0) {
-        int proto_size = src ? src->ByteSize() : 0;
-        head.size = proto_size + size;
-        data.reset(new uint8_t[head.size]);
-        if (src)
-            src->SerializeToArray(data.get(), proto_size);
-        if (buffer) {
-            memcpy(data.get() + proto_size, buffer, size);
-            head.ret = size;
+    void add_string(const std::string &in) {
+        uint32_t size = in.size();
+        add_buf(&size, 4);
+        add_buf(&in[0], size);
+    }
+
+    bool get_buf(void *buf, int size) {
+        if (offset + size > head.size) {
+            return false;
         }
+        memcpy(buf, &data[0] + offset, size);
+        offset += size;
+        return true;
     }
 
-    static int read(int fd, Msg &msg) {
-        if (-1 == read_buffer(fd, &msg.head, sizeof(MsgHead)))
+    bool get_string(std::string &out) {
+        uint32_t size;
+        if (!get_buf(&size, 4)) {
+            return false;
+        }
+        out.resize(size);
+        if (!get_buf(&out[0], size)) {
+            return false;
+        }
+        return true;
+    }
+
+    uint32_t get_rest(uint8_t **pdata) {
+        if (pdata)
+            *pdata = &data[0] + offset;
+        return head.size - offset;
+    }
+
+    static int from_fd(int fd, Msg &msg) {
+        if (-1 == read_buffer(fd, &msg.head, sizeof(Head)))
             return -1;
+        
+        //LOG_DEBUG("id:%d type:%d size:%d crc:%d ret:%d\n", 
+        //    msg.head.id, msg.head.type, msg.head.size,
+        //    msg.head.crc, msg.head.ret);
 
-        //LOG_DEBUG("recv type:%s id:%d ...\n", strmsg(msg.head.type), msg.head.id);
+        msg.resize(msg.head.size);
 
-        if (msg.head.size >= (1<<23)) {
-            LOG_ERROR("bad size: %d\n", msg.head.size);
-            abort();
-        }
-
-        msg.data.reset(new uint8_t[msg.head.size]);
-        if (-1 == read_buffer(fd, msg.data.get(), msg.head.size)) {
+        if (-1 == read_buffer(fd, &msg.data[0], msg.head.size)) {
             return -1;
         }
 
-        //LOG_DEBUG("recv type:%s id:%d ret: %d, done\n", strmsg(msg.head.type), msg.head.id, msg.head.ret);
-
+        //assert(msg.head.crc == crc16(CRC_SEED, &msg.data[0], msg.head.size));
+        
         return 0;
     }
 
-    static int write(int fd, const Msg &msg) {
-        //LOG_DEBUG("send type:%s id:%d ...\n", strmsg(msg.head.type), msg.head.id);
+    static int to_fd(int fd, Msg &msg) {
+        //assert(msg.head.size == msg.data.size());
+        //msg.head.crc = crc16(CRC_SEED, &msg.data[0], msg.head.size);
+        
+        ///LOG_DEBUG("id:%d type:%d size:%d crc:%d ret:%d\n", 
+        ///    msg.head.id, msg.head.type, msg.head.size,
+        ///    msg.head.crc, msg.head.ret);
 
-        if (-1 == write_buffer(fd, &msg.head, sizeof(MsgHead)))
+        if (-1 == write_buffer(fd, &msg.head, sizeof(Head)))
             return -1;
 
-        if (msg.head.size > 0 && -1 == write_buffer(fd, msg.data.get(), msg.head.size))
+        if (msg.head.size > 0 && -1 == write_buffer(fd, &msg.data[0], msg.head.size))
             return -1;
-
-        //LOG_DEBUG("send type:%s id:%d done\n", strmsg(msg.head.type), msg.head.id);
 
         return 0;
     }
 };
+
+typedef std::shared_ptr<Msg> PMsg;
 
 #endif

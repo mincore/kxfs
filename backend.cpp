@@ -21,29 +21,29 @@
 
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 
-extern const char *ROOT;
-
-static int readattr(const std::string &path, kxfs::Attr *attr) {
+static int readattr(const std::string &path, Msg::Attr &attr, PMsg out) {
     struct stat stbuf = {0};
     if (-1 == lstat(path.c_str(), &stbuf)) {
         LOG_ERROR("path:%s failed, err:%d %s\n", path.c_str(), errno, strerror(errno));
         return -1;
     }
 
-    attr->set_mode(stbuf.st_mode);
-    attr->set_size(stbuf.st_size);
-    attr->set_mtime(stbuf.st_mtime);
+    memset(&attr, 0, sizeof(attr));
+    attr.mode = stbuf.st_mode;
+    attr.size = stbuf.st_size;
+    attr.mtime = stbuf.st_mtime;
+    out->add_buf(&attr, sizeof(attr));
 
-    if ((stbuf.st_mode & S_IFMT) ==  S_IFLNK) {
+    if ((attr.mode & S_IFMT) ==  S_IFLNK) {
         char link[1024] = {0};
         readlink(path.c_str(), link, sizeof(link)-1);
-        attr->set_link(link);
+        out->add_string(link);
     }
 
     return 0;
 }
 
-static void readdir(const std::string &path, kxfs::Resp &resp) {
+static void readdir(const std::string &path, PMsg out) {
     struct dirent **namelist;
     int n;
 
@@ -58,10 +58,9 @@ static void readdir(const std::string &path, kxfs::Resp &resp) {
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
             continue;
 
-        auto file = resp.add_entries();
-        auto attr = file->mutable_attr();
-        file->set_path(name);
-        readattr(make_path(path, name), attr);
+        out->add_string(name);
+        Msg::Attr attr;
+        readattr(make_path(path, name), attr, out);
 
         free(namelist[i]);
     }
@@ -69,308 +68,402 @@ static void readdir(const std::string &path, kxfs::Resp &resp) {
     free(namelist);
 }
 
-static Msg OutMsg(const Msg &in) {
-    Msg out;
-    out.head.id = in.head.id;
-    out.head.type = in.head.type;
-    return out;
-}
+int Backend::impl_getattr(PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        LOG_INFO("get string failed\n");
+        return -1;
+    }
+    path = make_path(root_, path);
 
-class ReplayHelper {
-public:
-    ReplayHelper(Reply *reply, Msg *out): reply_(reply), out_(out) {}
-    ~ReplayHelper() { (*reply_)(*out_); }
-private:
-    Reply *reply_;
-    Msg *out_;
-};
-
-static bool func_getattr(const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    kxfs::Resp resp;
-    ReplayHelper helper(&reply, &out);
-
-    auto path = make_path(ROOT, req.paths(0));
-    auto file = resp.mutable_file();
-    auto attr = file->mutable_attr();
-
-    LOG_DEBUG("path:%s\n", path.c_str());
-
-    if (-1 == readattr(path, attr)) {
+    Msg::Attr attr;
+    if (-1 == readattr(path, attr, out)) {
         LOG_ERROR("path:%s failed\n", path.c_str());
-        out.head.ret = -errno;
-        return true;
+        return -errno;
+    }
+    
+    if ((attr.mode & S_IFMT) == S_IFDIR) {
+        readdir(path, out);
     }
 
-    if (attr->mode() & S_IFDIR) {
-        readdir(path, resp);
-    }
-
-    out.set_proto(&resp);
-    return true;
+    return 0;
 }
 
-static bool func_mkdir (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
+int Backend::impl_mkdir (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
 
-    auto path = make_path(ROOT, req.paths(0));
-    int mode = req.args(0);
+    int64_t mode;
+    if (!in->get_buf(&mode, sizeof(mode))) {
+        return -1;
+    }
 
     if (-1 == mkdir(path.c_str(), mode)) {
         LOG_ERROR("path:%s failed\n", path.c_str());
-        out.head.ret = -errno;
+        return -1;
     }
 
-    return true;
+    return 0;
 }
 
-static bool func_symlink (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
+int Backend::impl_symlink (PMsg in, PMsg out) {
+    std::string from;
+    if (!in->get_string(from)) {
+        return -1;
+    }
+    from = make_path(root_, from);
+    
+    std::string to;
+    if (!in->get_string(to)) {
+        return -1;
+    }
+    to = make_path(root_, to);
 
-    auto from = req.paths(0);
-    auto to = make_path(ROOT, req.paths(1));
     auto dname = make_dirname(to);
     auto bname = make_basename(to);
 
     int fd = open(dname.c_str(), O_DIRECTORY);
     if (fd == -1) {
         LOG_ERROR("open %s failed\n", dname.c_str());
-        out.head.ret = -errno;
-        return true;
+        return -errno;
     }
 
     if (-1 == symlinkat(from.c_str(), fd, bname.c_str())) {
         LOG_ERROR("from:%s to:%s failed\n", from.c_str(), to.c_str());
-        out.head.ret = -errno;
+        int err = errno;
+        close(fd);
+        return -err;
     }
 
     close(fd);
-    return true;
+    return 0;
 }
 
-static bool func_unlink (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
-
-    auto path = make_path(ROOT, req.paths(0));
+int Backend::impl_unlink (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
 
     if (-1 == unlink(path.c_str())) {
         LOG_ERROR("path:%s failed\n", path.c_str());
-        out.head.ret = -errno;
+        return -errno;
     }
 
-    return true;
+    return 0;
 }
 
-static bool func_rmdir (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
-
-    auto path = make_path(ROOT, req.paths(0));
+int Backend::impl_rmdir (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
 
     if (-1 == rmdir(path.c_str())) {
         LOG_ERROR("path:%s failed\n", path.c_str());
-        out.head.ret = -errno;
+        return -errno;
     }
 
-    return true;
+    return 0;
 }
 
-static bool func_rename (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
+int Backend::impl_rename (PMsg in, PMsg out) {
+    std::string from;
+    if (!in->get_string(from)) {
+        return -1;
+    }
+    from = make_path(root_, from);
 
-    auto from = make_path(ROOT, req.paths(0));
-    auto to = make_path(ROOT, req.paths(1));
+    std::string to;
+    if (!in->get_string(to)) {
+        return -1;
+    }
+    to = make_path(root_, to);
 
     if (-1 == rename(from.c_str(), to.c_str())) {
         LOG_ERROR("path:%s %s failed\n", from.c_str(), to.c_str());
-        out.head.ret = -errno;
+        return -errno;
     }
 
-    return true;
+    return 0;
 }
 
-static bool func_chmod (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
-
-    auto path = make_path(ROOT, req.paths(0));
-    int mode = req.args(0);
+int Backend::impl_chmod (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
+    
+    int64_t mode;
+    if (!in->get_buf(&mode, sizeof(mode))) {
+        return -1;
+    }
 
     if (-1 == chmod(path.c_str(), mode)) {
         LOG_ERROR("path:%s failed\n", path.c_str());
-        out.head.ret = -errno;
+        return -errno;
     }
 
-    return true;
+    return 0;
 }
 
-static bool func_truncate (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
-
-    auto path = make_path(ROOT, req.paths(0));
-    long long size = req.args(0);
+int Backend::impl_truncate (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
+    
+    uint64_t size;
+    if (!in->get_buf(&size, sizeof(size))) {
+        return -1;
+    }
 
     if (-1 == truncate(path.c_str(), size)) {
-        LOG_ERROR("path:%s size:%lld failed\n", path.c_str(), size);
-        out.head.ret = -errno;
+        LOG_ERROR("path:%s size:%lld failed\n", path.c_str(), (long long)size);
+        return -errno;
     }
 
-    return true;
+    return 0;
 }
 
-static bool func_utimens (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
+int Backend::impl_utimens (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
+    
+    uint64_t t1;
+    if (!in->get_buf(&t1, sizeof(t1))) {
+        return -1;
+    }
 
-    auto path = make_path(ROOT, req.paths(0));
-    long long t1 = req.args(0);
-    long long t2 = req.args(1);
+    uint64_t t2;
+    if (!in->get_buf(&t2, sizeof(t2))) {
+        return -1;
+    }
 
     int fd = open(path.c_str(), O_RDWR);
     if (-1 == fd) {
         LOG_ERROR("open %s failed\n", path.c_str());
-        out.head.ret = -errno;
-        return true;
+        return -errno;
     }
 
     struct timespec ts[2] = {
-        {t1>>32, t1 & 0xFFFFFFFF},
-        {t2>>32, t2 & 0xFFFFFFFF}
+        {(long)(t1>>32), (int)(t1 & 0xFFFFFFFF)},
+        {(long)(t2>>32), (int)(t2 & 0xFFFFFFFF)}
     };
 
     if (-1 == futimens(fd, ts)) {
-        LOG_ERROR("path:%s t1:%lld, t2:%lld failed\n", path.c_str(), t1, t2);
-        out.head.ret = -errno;
+        LOG_ERROR("path:%s t1:%lld, t2:%lld failed\n", path.c_str(), (long long)t1, (long long)t2);
+        int err = errno;
+        close(fd);
+        return -err;
     }
 
     close(fd);
-    return true;
+    return 0;
 }
 
-static bool func_create (const Msg &in, Reply reply) {
-    Msg out = OutMsg(in);
-    auto req = in.get_proto<kxfs::Req>();
-    ReplayHelper helper(&reply, &out);
-
-    auto path = make_path(ROOT, req.paths(0));
-    int mode = req.args(0);
-
-    int fd = creat(path.c_str(), mode);
-    if (-1 == fd) {
-        LOG_ERROR("path:%s mode:%d failed\n", path.c_str(), mode);
-        out.head.ret = -errno;
+int Backend::impl_read (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
+    
+    int64_t size;
+    if (!in->get_buf(&size, sizeof(size))) {
+        return -1;
     }
 
-    close(fd);
-    return true;
-}
+    uint64_t offset;
+    if (!in->get_buf(&offset, sizeof(offset))) {
+        return -1;
+    }
 
-static bool func_read (const Msg &in, Reply reply) {
-    auto req = in.get_proto<kxfs::Req>();
-
-    auto path = make_path(ROOT, req.paths(0));
-    size_t size = req.args(0);
-    off_t offset = req.args(1);
-
-    std::vector<char> buf(512*1024);
-
-    LOG_DEBUG("%s path:%s size:%lld offset:%lld\n", strmsg(in.head.type), path.c_str(),
+    LOG_DEBUG("%s path:%s size:%lld offset:%lld\n", strmsg(in->head.type), path.c_str(),
             (long long)size, (long long)offset);
 
     int fd = open(path.c_str(), O_RDONLY);
-    if (-1 == lseek(fd, offset, 0)) {
-        LOG_ERROR("seek %s offset:%lld failed\n", path.c_str(), (long long)offset);
-        Msg out = OutMsg(in);
-        ReplayHelper helper(&reply, &out);
-        out.head.ret = -errno;
-        return true;
-    }
-
-    while (size) {
-        Msg out = OutMsg(in);
-        ReplayHelper helper(&reply, &out);
-        out.head.has_more = 1;
-
-        int ntmp = std::min(size, buf.size());
-        int n = read(fd, &buf[0], ntmp);
-        if (n < 0) {
-            out.head.ret = -errno;
-            out.head.has_more = 0;
-            break;
-        }
-
-        if (n < ntmp)
-            size = 0;
-        else
-            size -= n;
-
-        if (size == 0) {
-            out.head.has_more = 0;
-        }
-
-        out.set_proto(NULL, &buf[0], n);
-    }
-
-    close(fd);
-    return true;
-}
-
-static bool func_write (const Msg &in, Reply reply) {
-    auto req = in.get_proto<kxfs::Req>();
-    auto path = make_path(ROOT, req.paths(0));
-    int size = (size_t)req.args(0);
-    off_t offset = (off_t)req.args(1);
-    uint8_t *data = in.data.get() + req.ByteSize();
-
-    LOG_DEBUG("id:%d, head.size:%d head.ret:%d, size:%d\n",
-            in.head.id, in.head.size, in.head.ret, size);
-
-    assert(size == in.head.size - req.ByteSize());
-
-    Msg out = OutMsg(in);
-    ReplayHelper helper(&reply, &out);
-
-    int fd = open(path.c_str(), O_CREAT | O_WRONLY);
     if (-1 == fd) {
-        out.head.ret = -errno;
-        return true;
+        LOG_ERROR("open %s failed\n", path.c_str());
+        return -errno;
     }
 
     if (offset > 0) {
-        lseek(fd, offset, SEEK_SET);
+        if (-1 == lseek(fd, offset, 0)) {
+            LOG_ERROR("seek %s offset:%lld failed\n", path.c_str(), (long long)offset);
+            int err = errno;
+            close(fd);
+            return -err;
+        }
     }
 
-    int n = write(fd, data, size);
-    out.head.ret = n < 0 ? -errno : n;
+    out->resize(size);
+    size = read(fd, &out->data[0], size);
+    if (size < 0) {
+         int err = errno;
+         close(fd);
+         return -err;
+    }
 
     close(fd);
-    return true;
+    out->resize(size);
+    return size;
 }
 
-static cmd_func funcs[] = {
-    func_getattr, func_mkdir, func_symlink, func_unlink,
-    func_rmdir, func_rename, func_chmod, func_truncate,
-    func_utimens, func_create, func_read, func_write,
-};
-
-extern cmd_func get_cmd_func(uint16_t type) {
-    if (type >= ARRAY_SIZE(funcs)) {
-        return NULL;
+int Backend::impl_write (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
+    
+    int64_t size;
+    if (!in->get_buf(&size, sizeof(size))) {
+        return -1;
     }
 
-    return funcs[type];
+    uint64_t offset;
+    if (!in->get_buf(&offset, sizeof(offset))) {
+        return -1;
+    }
+
+    uint64_t id;
+    if (!in->get_buf(&id, sizeof(id))) {
+        return -1;
+    }
+    LOG_INFO("fh id: %d\n", (int)id);
+
+    uint8_t *data;
+    in->get_rest(&data);
+    
+    LOG_DEBUG("id:%d, head.size:%d head.ret:%d, size:%lld\n",
+            in->head.id, in->head.size, in->head.ret, (long long)size);
+
+    bool find = false;
+    int fd = -1;
+    {
+        std::unique_lock<std::mutex> lk(fdmaps_mutex_);
+        auto it = fdmaps_.find(id);
+        if (it != fdmaps_.end()) {
+            fd = it->second;
+            find = true;
+            LOG_INFO("find id: %d\n", (int)id);
+        }
+    }
+
+    if (!find) {
+        fd = open(path.c_str(), O_CREAT | O_WRONLY);
+        if (-1 == fd) {
+            LOG_INFO("open %s failed\n", path.c_str());
+            return -errno;
+        }
+    }
+
+    if (offset > 0) {
+        if (-1 == lseek(fd, offset, SEEK_SET)) {
+            int err = errno;
+            close(fd);
+            return -err;
+        }
+    }
+
+    size = write(fd, data, size);
+    if (size < 0) {
+        int err = errno;
+        if (!find) close(fd);
+        return -err;
+    }
+
+    if (!find) close(fd);
+    out->resize(size);
+    return size;
+}
+
+int Backend::impl_create (PMsg in, PMsg out) {
+    std::string path;
+    if (!in->get_string(path)) {
+        return -1;
+    }
+    path = make_path(root_, path);
+    
+    uint64_t mode;
+    if (!in->get_buf(&mode, sizeof(mode))) {
+        return -1;
+    }
+
+    LOG_DEBUG("id:%d, head.size:%d head.type:%d\n",
+            in->head.id, in->head.size, in->head.type);
+
+    int fd = creat(path.c_str(), mode);
+    if (fd == -1) {
+        return -errno;
+    }
+
+    int id;
+    {
+        std::unique_lock<std::mutex> lk(fdmaps_mutex_);
+        id = fd_index_++;
+        fdmaps_[id] = fd;
+    }
+
+    LOG_INFO("created id: %d\n", id);
+    out->add_buf(&id, sizeof(id));
+    return 0;
+}
+
+int Backend::impl_release (PMsg in, PMsg out) {
+    uint64_t id;
+    if (!in->get_buf(&id, sizeof(id))) {
+        return -1;
+    }
+
+    std::unique_lock<std::mutex> lk(fdmaps_mutex_);
+    auto it = fdmaps_.find((int)id);
+    if (it != fdmaps_.end()) {
+        int fd = it->second;
+        fdmaps_.erase(it);
+        close(fd);
+        LOG_INFO("release id: %d\n", (int)id);
+    }
+
+    return 0;
+}
+
+int Backend::impl_hello(PMsg in, PMsg out) {
+    return 0;
+}
+
+int Backend::impl_keepalive(PMsg in, PMsg out) {
+    return 0;
+}
+
+int Backend::process_msg(PMsg in, PMsg out) {
+    switch (in->head.type) {
+    case Msg::HELLO:      return impl_hello(in, out);
+    case Msg::KEEPALIVE:  return impl_keepalive(in, out);
+    case Msg::GETATTR:    return impl_getattr(in, out); 
+    case Msg::MKDIR:      return impl_mkdir(in, out); 
+    case Msg::SYMLINK:    return impl_symlink(in, out); 
+    case Msg::UNLINK:     return impl_unlink(in, out); 
+    case Msg::RMDIR:      return impl_rmdir(in, out); 
+    case Msg::RENAME:     return impl_rename(in, out); 
+    case Msg::CHMOD:      return impl_chmod(in, out); 
+    case Msg::TRUNCATE:   return impl_truncate(in, out); 
+    case Msg::UTIMENS:    return impl_utimens(in, out); 
+    case Msg::READ:       return impl_read(in, out); 
+    case Msg::WRITE:      return impl_write(in, out); 
+    case Msg::CREATE:     return impl_create(in, out); 
+    case Msg::RELEASE:    return impl_release(in, out); 
+    default:              return -1;
+    }
 }

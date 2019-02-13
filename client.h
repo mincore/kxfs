@@ -11,6 +11,7 @@
 
 #include <thread>
 #include <atomic>
+#include <map>
 #include <list>
 #include "utils.h"
 #include "msg.h"
@@ -21,31 +22,25 @@ class Cache;
 
 struct Req {
     Msg req;
-    Future<Msg> resp;
+    Future<PMsg> resp;
 };
 
 class Client {
 public:
-    ~Client() {
-        if (-1 != sock_) {
-            exit();
-        }
-    }
+    bool connect(const char *host, uint16_t port);
+    void start();
+    void stop();
 
-    bool start(const char *host, uint16_t port);
-
-    Future<Msg> send(
-        MSG_TYPE type,
+    Future<PMsg> send(
+        Msg::Type type,
         const std::vector<const char *> &paths,
         const std::vector<int64_t> &args = {},
-        uint64_t *fh = NULL,
         const void *buffer = NULL,
         int size = 0) {
-        auto req = make_req(fh ? (uint32_t)(*fh): new_id(), type, paths, args, buffer, size);
+        auto req = make_req(new_id(), type, paths, args, buffer, size);
         queue_req(req.req);
         return req.resp;
     }
-    void del_future(uint32_t id);
 
     void del_node(const char *path, bool parent_too = true);
     Node get_node(const char *path);
@@ -58,27 +53,29 @@ private:
     void send_reqs();
     void recv_resps();
     void queue_req(const Msg &req);
-    Future<Msg> make_future(uint32_t id);
+    Future<PMsg> make_future(uint32_t id);
+    Node node_from_msg(const char* path, Msg &msg);
 
     Req make_req(
         uint32_t id,
-        MSG_TYPE type,
+        Msg::Type type,
         const std::vector<const char *> &paths,
         const std::vector<int64_t> &args = {},
         const void *buffer = NULL,
         int size = 0);
 
-    void exit();
-
 private:
     int sock_ = -1;
+
+    std::thread send_thread_;
+    std::thread recv_thread_;
 
     std::mutex reqs_mutex_;
     std::condition_variable reqs_cond_;
     std::list<Msg> reqs_;
 
     std::mutex future_map_mutex_;
-    std::multimap<int, Future<Msg> > future_map_;
+    std::multimap<int, Future<PMsg> > future_map_;
 
     bool quit_ = false;
     Cache cache_;
