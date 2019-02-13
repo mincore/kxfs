@@ -23,7 +23,12 @@
 
 static int readattr(const std::string &path, Msg::Attr &attr, PMsg out) {
     struct stat stbuf = {0};
+
+#ifndef _WIN32
     if (-1 == lstat(path.c_str(), &stbuf)) {
+#else
+    if (-1 == stat(path.c_str(), &stbuf)) {
+#endif
         LOG_ERROR("path:%s failed, err:%d %s\n", path.c_str(), errno, strerror(errno));
         return -1;
     }
@@ -34,38 +39,36 @@ static int readattr(const std::string &path, Msg::Attr &attr, PMsg out) {
     attr.mtime = stbuf.st_mtime;
     out->add_buf(&attr, sizeof(attr));
 
+#ifndef _WIN32
     if ((attr.mode & S_IFMT) ==  S_IFLNK) {
         char link[1024] = {0};
         readlink(path.c_str(), link, sizeof(link)-1);
         out->add_string(link);
     }
+#endif
 
     return 0;
 }
 
 static void readdir(const std::string &path, PMsg out) {
-    struct dirent **namelist;
-    int n;
-
-    n = scandir(path.c_str(), &namelist, NULL, NULL);
-    if (n < 0) {
-        LOG_ERROR("path:%s failed\n", path.c_str());
+    struct dirent *ent;
+    DIR *dir = opendir(path.c_str());
+    if (!dir) {
+        LOG_ERROR("opendir %s failed\n", path.c_str());
         return;
     }
 
-    for (int i=0; i<n; i++) {
-        const char *name = namelist[i]->d_name;
+    while ((ent = readdir(dir)) != NULL) {
+        const char *name = ent->d_name;
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
             continue;
 
         out->add_string(name);
         Msg::Attr attr;
         readattr(make_path(path, name), attr, out);
-
-        free(namelist[i]);
     }
 
-    free(namelist);
+    closedir (dir);
 }
 
 int Backend::impl_getattr(PMsg in, PMsg out) {
@@ -101,7 +104,11 @@ int Backend::impl_mkdir (PMsg in, PMsg out) {
         return -1;
     }
 
+#ifndef _WIN32
     if (-1 == mkdir(path.c_str(), mode)) {
+#else
+    if (-1 == mkdir(path.c_str())) {
+#endif
         LOG_ERROR("path:%s failed\n", path.c_str());
         return -1;
     }
@@ -125,6 +132,7 @@ int Backend::impl_symlink (PMsg in, PMsg out) {
     auto dname = make_dirname(to);
     auto bname = make_basename(to);
 
+#ifndef _WIN32
     int fd = open(dname.c_str(), O_DIRECTORY);
     if (fd == -1) {
         LOG_ERROR("open %s failed\n", dname.c_str());
@@ -139,6 +147,8 @@ int Backend::impl_symlink (PMsg in, PMsg out) {
     }
 
     close(fd);
+#endif
+
     return 0;
 }
 
@@ -250,6 +260,7 @@ int Backend::impl_utimens (PMsg in, PMsg out) {
         return -1;
     }
 
+#ifndef _WIN32
     int fd = open(path.c_str(), O_RDWR);
     if (-1 == fd) {
         LOG_ERROR("open %s failed\n", path.c_str());
@@ -269,6 +280,8 @@ int Backend::impl_utimens (PMsg in, PMsg out) {
     }
 
     close(fd);
+#endif
+
     return 0;
 }
 

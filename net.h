@@ -14,7 +14,7 @@ int netlisten(int istcp, const char *server, int port);
 int netaccept(int fd, char *server, int *port);
 int netconnect(int istcp, const char *server, int port);
 int netnonblock(int fd);
-void netkeepalive(int fd);
+int netkeepalive(int fd);
 }
 
 #endif

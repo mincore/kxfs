@@ -6,30 +6,39 @@
  * Description:
  * ===================================================
  */
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef int socklen_t;
+#else
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/poll.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdint.h>
 
-void netnonblock(int fd)
-{
+int netnonblock(int fd) {
+#ifdef _WIN32
+    long non_blocking = 1;
+    return ioctlsocket(fd, FIONBIO, (u_long*)&non_blocking);
+#else
     int flag = fcntl(fd, F_GETFL, 0);
-    if ( -1 != flag )
-        fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+    return fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+#endif
 }
 
-void netkeepalive(int fd)
-{
-    int keepalive = 1;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive , sizeof(keepalive));
+int netkeepalive(int fd) {
+    char keepalive = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive , sizeof(keepalive));
 }
 
 static int parseip(const char *name, uint32_t *ip)
@@ -114,7 +123,7 @@ int netlisten(int istcp, const char *server, int port)
     }
 
     /* set reuse flag for tcp */
-    if(istcp && getsockopt(fd, SOL_SOCKET, SO_TYPE, (void*)&n, &sn) >= 0){
+    if(istcp && getsockopt(fd, SOL_SOCKET, SO_TYPE, (char*)&n, &sn) >= 0){
         n = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char*)&n, sizeof n);
     }
@@ -138,7 +147,7 @@ int netaccept(int fd, char *server, int *port)
     socklen_t len;
 
     len = sizeof sa;
-    if((cfd = accept(fd, (void*)&sa, &len)) < 0){
+    if((cfd = accept(fd, (struct sockaddr*)&sa, &len)) < 0){
         return -1;
     }
     if(server){
@@ -169,8 +178,7 @@ int netconnect(int istcp, char *server, int port)
 
     /* for udp */
     if(!istcp){
-        n = 1;
-        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &n, sizeof n);
+        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, (const char*)&n, sizeof(n));
     }
 
     /* start connecting */
@@ -184,7 +192,7 @@ int netconnect(int istcp, char *server, int port)
     }
 
     int opt = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
 
     sn = sizeof sa;
     if(getpeername(fd, (struct sockaddr*)&sa, &sn) >= 0){
@@ -192,8 +200,8 @@ int netconnect(int istcp, char *server, int port)
     }
 
     /* report error */
-    sn = sizeof n;
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, (void*)&n, &sn);
+    sn = 4;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&n, &sn);
     if(n == 0)
         n = ECONNREFUSED;
     close(fd);
